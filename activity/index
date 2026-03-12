@@ -1,0 +1,1683 @@
+import pandas as pd
+import re
+import json
+from pathlib import Path
+import numpy as np
+
+# =========================================================
+# 0) 설정
+# =========================================================
+BASE_DIR = Path(r"C:\Users\user\Desktop\파이썬\콜&제설 데이터")  # <-- 너 폴더
+REPORT_DIR = BASE_DIR / "report"
+DATA_DIR = REPORT_DIR / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+OUT_HTML = REPORT_DIR / "report_offline.html"
+
+KEEP_ROLES = {"02팀장", "03팀원"}  # 01지점장 제외
+
+EMP_CODE_PATTERN = re.compile(r"\b\d{7}\b")
+YM_MASTER_RE = re.compile(r"^(20\d{2}(0[1-9]|1[0-2]))MASTER\.txt$", re.IGNORECASE)
+
+# 날짜 컬럼 후보
+CALL_DATE_CANDIDATES = ["방문일", "일자", "콜일자", "활동일", "활동일자", "방문일자", "실행일", "일시", "date"]
+SM_DATE_CANDIDATES   = ["제품설명회실행일", "실행일", "일자", "date"]
+
+
+# =========================================================
+# 1) 공통 유틸
+# =========================================================
+def load_txt(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        raise FileNotFoundError(f"파일을 찾을 수 없습니다: {path.resolve()}")
+
+    # 1) 탭 우선
+    try:
+        df = pd.read_csv(path, sep="\t", encoding="utf-8-sig", dtype=str)
+        if df.shape[1] > 1:
+            return df
+    except Exception:
+        pass
+
+    # 2) 자동 구분자
+    return pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig", dtype=str)
+
+
+def extract_emp_codes_from_text(x):
+    if pd.isna(x):
+        return []
+    return EMP_CODE_PATTERN.findall(str(x))
+
+
+def normalize_field_type(s: str) -> str:
+    s = "" if pd.isna(s) else str(s)
+    if "병원" in s:
+        return "병원"
+    if "종병" in s:
+        return "종병"
+    if "성장" in s:
+        return "성장"
+    return "기타"
+
+
+def find_date_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    cols = [c.strip() for c in df.columns]
+    df.columns = cols
+
+    for c in candidates:
+        if c in cols:
+            return c
+    for c in cols:
+        if "일자" in c or c.endswith("일") or "date" in c.lower():
+            return c
+    return None
+
+
+def to_yyyy_mm_dd(x) -> str | None:
+    if pd.isna(x):
+        return None
+    s = str(x).strip()
+    if not s or s.lower() in {"nan", "none"}:
+        return None
+
+    m = re.match(r"^(\d{4})(\d{2})(\d{2})$", s)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", s)
+    if m:
+        return s
+
+    m = re.match(r"^(\d{4})/(\d{2})/(\d{2})$", s)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+
+    m = re.match(r"^(\d{4})\.(\d{2})\.(\d{2})$", s)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+
+    return None
+
+
+def make_master_lookup(master_m: pd.DataFrame) -> dict:
+    mm = master_m.copy()
+    mm["사번"] = mm["사번"].astype(str).str.strip()
+    mm = mm[mm["사번"] != ""].dropna(subset=["사번"])
+    mm = mm.drop_duplicates(subset=["사번"], keep="first")
+    return mm.set_index("사번").to_dict(orient="index")
+
+
+def load_activity(path: Path) -> pd.DataFrame:
+    df = load_txt(path)
+    df.columns = [c.strip() for c in df.columns]
+
+    if "사번" not in df.columns:
+        for cand in ["사원코드", "사원코드1", "사원코드2"]:
+            if cand in df.columns:
+                df = df.rename(columns={cand: "사번"})
+                break
+    if "사번" not in df.columns:
+        raise ValueError(f"ACT 파일에 사번 컬럼이 없습니다: {path.name} / {list(df.columns)}")
+
+    days_col = None
+    for c in df.columns:
+        if "활동일수" in c:
+            days_col = c
+            break
+    if not days_col:
+        raise ValueError(f"ACT 파일에서 활동일수 컬럼을 못 찾았습니다: {path.name} / {list(df.columns)}")
+
+    out = df.rename(columns={days_col: "활동일수"}).copy()
+    out["사번"] = out["사번"].astype(str).str.strip()
+    out["활동일수"] = pd.to_numeric(out["활동일수"], errors="coerce").fillna(0)
+    return out[["사번", "활동일수"]]
+
+
+# =========================================================
+# 2) SM(식사) 카운트 + events
+#    - SM 달력 표시: 고객(거래처)-품목(구분명 구분)
+# =========================================================
+def load_sm_meal_counts_and_events(ym: str, master_m: pd.DataFrame):
+    sm_path = BASE_DIR / f"{ym}SM.txt"
+    if not sm_path.exists():
+        return pd.DataFrame(columns=["사번", "lunch", "dinner"]), []
+
+    df = load_txt(sm_path)
+    df.columns = [c.strip() for c in df.columns]
+
+    if "고객코드" not in df.columns or "구분" not in df.columns:
+        raise ValueError(f"[{ym}] SM 파일 컬럼 필요: 고객코드, 구분 / 현재: {list(df.columns)} / 파일: {sm_path.name}")
+
+    date_col = find_date_col(df, SM_DATE_CANDIDATES)
+
+    x = df.copy()
+    x["고객코드"] = x["고객코드"].astype(str).str.strip()
+    x["구분"] = x["구분"].astype(str).str.strip()
+
+    x["mealType"] = x["구분"].map({"석식": "dinner", "조식": "lunch", "중식": "lunch"})
+    x = x.dropna(subset=["고객코드", "mealType"])
+    x = x[x["고객코드"] != ""]
+
+    pivot = x.pivot_table(index="고객코드", columns="mealType", aggfunc="size", fill_value=0).reset_index()
+    if "lunch" not in pivot.columns:
+        pivot["lunch"] = 0
+    if "dinner" not in pivot.columns:
+        pivot["dinner"] = 0
+
+    meal_counts = pivot.rename(columns={"고객코드": "사번"})[["사번", "lunch", "dinner"]].copy()
+    meal_counts["사번"] = meal_counts["사번"].astype(str).str.strip()
+    meal_counts["lunch"] = pd.to_numeric(meal_counts["lunch"], errors="coerce").fillna(0).astype(int)
+    meal_counts["dinner"] = pd.to_numeric(meal_counts["dinner"], errors="coerce").fillna(0).astype(int)
+
+    master_lookup = make_master_lookup(master_m)
+    x["_date"] = x[date_col].apply(to_yyyy_mm_dd) if date_col else None
+
+    acc_col = "거래처" if "거래처" in x.columns else ("거래처명" if "거래처명" in x.columns else None)
+    cust_col = "고객" if "고객" in x.columns else ("고객명" if "고객명" in x.columns else None)
+    item_col = "품목" if "품목" in x.columns else ("품목명" if "품목명" in x.columns else None)
+
+    events = []
+    for _, r in x.iterrows():
+        emp = str(r["고객코드"]).strip()
+        if emp not in master_lookup:
+            continue
+        d = r["_date"]
+        if not d:
+            continue
+        info = master_lookup[emp]
+
+        evt = {
+            "date": d,
+            "type": "SM",
+            "empCode": emp,
+            "empName": info.get("사원명", ""),
+            "role": info.get("직책", ""),
+            "region": info.get("권역명", ""),
+            "team": info.get("부과명2", ""),
+            "field": info.get("분야", ""),
+
+            "account": str(r.get(acc_col, "") or "").strip() if acc_col else "",
+            "person": str(r.get(cust_col, "") or "").strip() if cust_col else "",
+            "item": str(r.get(item_col, "") or "").strip() if item_col else "",
+            "kindName": str(r.get("구분명", "") or "").strip(),
+            "kind": str(r.get("구분", "") or "").strip(),
+        }
+        events.append(evt)
+
+    return meal_counts, events
+
+
+# =========================================================
+# 3) CALL 카운트 + events
+# =========================================================
+def load_call_counts_and_events(ym: str, call_path: Path, master_m: pd.DataFrame):
+    call = load_txt(call_path)
+    call.columns = [c.strip() for c in call.columns]
+
+    need_min = {"담당자", "구분", "담당자분야", "방문일"}
+    miss_min = need_min - set(call.columns)
+    if miss_min:
+        raise ValueError(f"{ym} CALL 최소 필수 컬럼 누락: {miss_min} / 현재: {list(call.columns)}")
+
+    has_comp = "동행자" in call.columns
+    date_col = find_date_col(call, CALL_DATE_CANDIDATES)
+
+    c = call.copy()
+    c["구분"] = c["구분"].astype(str).str.strip()
+    c = c[c["구분"].ne("D2")].copy()  # ✅ D2만 제외
+
+    c["담당자"] = c["담당자"].astype(str).str.strip()
+    c["_date"] = c[date_col].apply(to_yyyy_mm_dd) if date_col else None
+
+    owner_rows = c[["담당자"]].rename(columns={"담당자": "participant"}).copy()
+    owner_rows["participant"] = owner_rows["participant"].astype(str).str.strip()
+
+    all_rows = owner_rows.copy()
+    if has_comp:
+        comp = c[["동행자"]].copy()
+        comp["participant"] = comp["동행자"].apply(extract_emp_codes_from_text)
+        comp = comp.explode("participant")
+        comp = comp[comp["participant"].notna() & (comp["participant"].astype(str).str.len() > 0)]
+        comp["participant"] = comp["participant"].astype(str).str.strip()
+        comp = comp[["participant"]]
+        all_rows = pd.concat([all_rows, comp], ignore_index=True)
+
+    cnt_owner_total = owner_rows.groupby("participant", dropna=False).size().rename("total_calls_owner").reset_index()
+    cnt_all_total = all_rows.groupby("participant", dropna=False).size().rename("total_calls_all").reset_index()
+
+    counts = cnt_owner_total.merge(cnt_all_total, on="participant", how="outer").fillna(0)
+    counts["total_calls_owner"] = counts["total_calls_owner"].astype(int)
+    counts["total_calls_all"] = counts["total_calls_all"].astype(int)
+    counts = counts.rename(columns={"participant": "사번"})
+
+    master_lookup = make_master_lookup(master_m)
+    events = []
+
+    for _, r in c.iterrows():
+        d = r["_date"]
+        if not d:
+            continue
+
+        participants = []
+        owner_emp = str(r.get("담당자", "") or "").strip()
+        if owner_emp:
+            participants.append(owner_emp)
+        if has_comp:
+            participants.extend(extract_emp_codes_from_text(r.get("동행자", "")))
+        participants = [p for p in dict.fromkeys(participants) if p]
+
+        acc = str(r.get("거래처명", "") or "").strip()
+        hcp = str(r.get("고객명", "") or "").strip()
+        item = str(r.get("품목명", "") or "").strip()
+
+        if not acc:
+            acc = str(r.get("거래처", "") or "").strip()
+        if not hcp:
+            hcp = str(r.get("고객", "") or "").strip()
+        if not item:
+            item = str(r.get("품목", "") or "").strip()
+
+        for emp in participants:
+            if emp not in master_lookup:
+                continue
+            info = master_lookup[emp]
+            events.append({
+                "date": d,
+                "type": "CALL",
+                "empCode": emp,
+                "empName": info.get("사원명", ""),
+                "role": info.get("직책", ""),
+                "region": info.get("권역명", ""),
+                "team": info.get("부과명2", ""),
+                "field": info.get("분야", ""),
+
+                "account": acc,
+                "person": hcp,
+                "item": item,
+            })
+
+    return counts, events
+
+
+# =========================================================
+# 4) 월 JSON 생성
+# =========================================================
+def build_month_json(ym: str, master_path: Path, call_path: Path, act_path: Path) -> dict:
+    master = load_txt(master_path)
+    master.columns = [c.strip() for c in master.columns]
+
+    if "권역코드" not in master.columns and "권코드" in master.columns:
+        master = master.rename(columns={"권코드": "권역코드"})
+
+    if "사원코드1" in master.columns:
+        emp_col = "사원코드1"
+    elif "사원코드2" in master.columns:
+        emp_col = "사원코드2"
+    else:
+        raise ValueError(f"{ym} MASTER에 사원코드1/2가 없습니다: {list(master.columns)}")
+
+    need_master = {"권역코드", "권역명", "부과코드", "부과명2", "분야", "사원명", "직책"}
+    miss_m = need_master - set(master.columns)
+    if miss_m:
+        raise ValueError(f"{ym} MASTER 필수 컬럼 누락: {miss_m}")
+
+    m = master.copy().rename(columns={emp_col: "사번"})
+    for col in ["사번", "부과코드", "직책", "분야", "권역코드", "권역명", "부과명2", "사원명"]:
+        m[col] = m[col].astype(str).str.strip()
+
+    m = m[m["직책"].isin(KEEP_ROLES)].copy()
+    m = m[~m["부과코드"].str.endswith("00", na=False)].copy()
+    m["fieldType"] = m["분야"].apply(normalize_field_type)
+
+    m = m.drop_duplicates(subset=["사번"], keep="first")
+
+    act = load_activity(act_path)
+    m = m.merge(act, on="사번", how="left")
+    m["활동일수"] = pd.to_numeric(m["활동일수"], errors="coerce").fillna(0)
+
+    meal_counts, sm_events = load_sm_meal_counts_and_events(ym, m)
+    m = m.merge(meal_counts, on="사번", how="left")
+    m["lunch"] = pd.to_numeric(m.get("lunch", 0), errors="coerce").fillna(0).astype(int)
+    m["dinner"] = pd.to_numeric(m.get("dinner", 0), errors="coerce").fillna(0).astype(int)
+
+    call_counts, call_events = load_call_counts_and_events(ym, call_path, m)
+    out = m.merge(call_counts, on="사번", how="left")
+    out["total_calls_owner"] = pd.to_numeric(out.get("total_calls_owner", 0), errors="coerce").fillna(0).astype(int)
+    out["total_calls_all"] = pd.to_numeric(out.get("total_calls_all", 0), errors="coerce").fillna(0).astype(int)
+
+    out["total_calls"] = 0
+    m03 = out["직책"].eq("03팀원")
+    m02 = out["직책"].eq("02팀장")
+    out.loc[m03, "total_calls"] = out.loc[m03, "total_calls_owner"]
+    out.loc[m02, "total_calls"] = out.loc[m02, "total_calls_all"]
+
+    out[ym] = np.where(out["활동일수"] > 0, out["total_calls"] / out["활동일수"], 0.0)
+    out[ym] = pd.to_numeric(out[ym], errors="coerce").fillna(0).round(2)
+
+    rows = []
+    for _, r in out.iterrows():
+        rows.append({
+            "ym": ym,
+            "region": str(r["권역명"] or ""),
+            "team": str(r["부과명2"] or ""),
+            "field": str(r["분야"] or ""),
+            "role": str(r["직책"] or ""),
+            "empCode": str(r["사번"] or ""),
+            "empName": str(r["사원명"] or ""),
+            "kpi": {
+                "avg": float(r[ym]),
+                "lunch": int(r["lunch"]),
+                "dinner": int(r["dinner"]),
+            }
+        })
+
+    events = call_events + sm_events
+    return {"rows": rows, "events": events}
+
+
+def find_months(base_dir: Path):
+    months = []
+    for p in base_dir.iterdir():
+        if p.is_file():
+            m = YM_MASTER_RE.match(p.name)
+            if m:
+                months.append(m.group(1))
+    return sorted(set(months))
+
+
+def generate_all_months_json():
+    months = find_months(BASE_DIR)
+    if not months:
+        print("MASTER 파일(YYYYMMMASTER.txt)을 찾지 못했습니다.")
+        return
+
+    made = 0
+    for ym in months:
+        master_path = BASE_DIR / f"{ym}MASTER.txt"
+        call_path = BASE_DIR / f"{ym}CALL.txt"
+        act_path = BASE_DIR / f"{ym}ACT.txt"
+
+        if not call_path.exists() or not act_path.exists():
+            print(f"[SKIP] {ym}: CALL 또는 ACT 파일이 없음")
+            continue
+
+        try:
+            payload = build_month_json(ym, master_path, call_path, act_path)
+            out_path = DATA_DIR / f"{ym}.json"
+            out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"[OK] {ym} -> {out_path}")
+            made += 1
+        except Exception as e:
+            print(f"[FAIL] {ym}: {e}")
+
+    print(f"완료: {made}개 월 JSON 생성")
+
+
+# =========================================================
+# 5) report_offline.html 생성
+# =========================================================
+def load_months(data_dir: Path):
+    store = {}
+    months = []
+    for p in sorted(data_dir.glob("20????.json")):
+        ym = p.stem
+        store[ym] = json.loads(p.read_text(encoding="utf-8"))
+        months.append(ym)
+    return sorted(months), store
+
+
+def generate_report_html():
+    months, store = load_months(DATA_DIR)
+    if not months:
+        raise ValueError(f"{DATA_DIR}에 20YYYYMM.json 파일이 없습니다. JSON 생성이 먼저 성공해야 합니다.")
+
+    MONTHS_JSON = json.dumps(months, ensure_ascii=False)
+    STORE_JSON = json.dumps(store, ensure_ascii=False)
+
+    HTML_TEMPLATE = r"""<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>월간 리포트 (오프라인)</title>
+
+  <script>
+    window.__DATA_MONTHS__ = __MONTHS_JSON__;
+    window.__DATASTORE__ = __STORE_JSON__;
+  </script>
+
+  <style>
+    :root{
+      --bg:#f6f7fb; --panel:#ffffff; --panel2:#f2f4f8; --text:#0f172a; --muted:#64748b;
+      --line:#e5e7eb; --accent:#2563eb; --chip:#e8eefc;
+    }
+    *{ box-sizing:border-box; }
+    body{ margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,"Noto Sans KR",sans-serif; background:var(--bg); color:var(--text); }
+
+    .topbar{
+      position:sticky; top:0; z-index:10;
+      background:rgba(246,247,251,.92); backdrop-filter: blur(6px);
+      border-bottom:1px solid var(--line);
+      padding:12px 16px;
+      display:grid; gap:10px;
+    }
+    .topRow{ display:flex; align-items:center; gap:10px; }
+    .titleTop{ font-weight:900; }
+    .subTop{ color:var(--muted); font-size:12px; margin-left:6px; }
+    .spacer{ flex:1; }
+    .filterRow{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+
+    .btn{ background:var(--accent); border:none; color:white; padding:10px 12px; border-radius:10px; cursor:pointer; font-weight:800; }
+    .btn.ghost{ background:transparent; border:1px solid var(--line); color:var(--text); }
+
+    select, input{
+      background:var(--panel); color:var(--text);
+      border:1px solid var(--line);
+      padding:10px 12px; border-radius:10px;
+    }
+    input{ width:260px; }
+
+    .wrap{ padding:16px; display:grid; gap:14px; grid-template-columns: 520px 1fr; }
+    .card{ background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:14px; box-shadow:0 1px 0 rgba(0,0,0,.02); }
+    .cardTitle{ font-size:16px; font-weight:900; }
+    .cardSub{ color:var(--muted); font-size:12px; margin-top:2px; }
+
+    .tabs{ display:flex; gap:8px; margin-top:10px; flex-wrap:wrap; }
+    .tab{
+      padding:8px 10px; border-radius:999px; border:1px solid var(--line);
+      background:transparent; color:var(--text); cursor:pointer; font-weight:800;
+    }
+    .tab.active{ background:rgba(37,99,235,.12); border-color:rgba(37,99,235,.35); }
+
+    .kpi{ display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:12px;}
+    .kpi .item{ background:var(--panel2); border:1px solid var(--line); border-radius:12px; padding:12px; }
+    .label{ color:var(--muted); font-size:12px; }
+    .value{ font-size:18px; font-weight:900; margin-top:6px; font-variant-numeric: tabular-nums; }
+
+    .grid{ overflow:auto; border-radius:14px; border:1px solid var(--line); margin-top:10px; background:var(--panel);}
+    table{ width:100%; border-collapse:separate; border-spacing:0; min-width:1350px; table-layout:fixed; }
+    thead th{ position:sticky; top:0; background:var(--panel2); z-index:2; }
+    th, td{
+      padding:10px 10px; border-bottom:1px solid var(--line); border-right:1px solid var(--line);
+      text-align:center; white-space:nowrap; min-width:160px;
+    }
+    th:first-child, td:first-child{
+      position:sticky; left:0; background:var(--panel2); z-index:3; text-align:left; min-width:140px;
+    }
+    tr:hover td{ background:rgba(37,99,235,.06); }
+    .left{ text-align:left; }
+    .center{ text-align:center !important; }
+    .num{ font-variant-numeric: tabular-nums; }
+
+    /* ============================================================
+       === [PATCH A] 상단 오른쪽 "선택 권역/팀/인원 평균" 카드 3개
+       ============================================================ */
+    .scopeKpis{
+      margin-left:auto;
+      display:flex;
+      gap:8px;
+      align-items:stretch;
+      flex-wrap:wrap;
+    }
+    .scopeKpi{
+      background:var(--panel2);
+      border:1px solid var(--line);
+      border-radius:12px;
+      padding:8px 10px;
+      min-width:210px;
+    }
+    .scopeLbl{ color:var(--muted); font-size:11px; font-weight:900; }
+    .scopeVal{ margin-top:4px; font-weight:900; font-variant-numeric: tabular-nums; }
+    .scopeSub{ margin-top:2px; color:var(--muted); font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+
+    /* Calendar */
+    #calendarView{ display:none; padding:16px; }
+    .calTop{ display:flex; gap:10px; align-items:center; justify-content:space-between; flex-wrap:wrap; }
+    .calNav{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+
+    .calWrap{ display:flex; gap:12px; margin-top:12px; align-items:flex-start; }
+    .calSide{
+      background:var(--panel);
+      border:1px solid var(--line);
+      border-radius:14px;
+      padding:12px;
+
+      width:360px;
+      min-width:260px;
+      max-width:780px;
+
+      resize:horizontal;
+      overflow:auto;
+
+      position:sticky;
+      top:110px;
+      max-height: calc(100vh - 140px);
+    }
+    .calSide::after{
+      content:"↔";
+      position:absolute;
+      top:50%;
+      right:6px;
+      transform:translateY(-50%);
+      color:var(--muted);
+      font-weight:900;
+      font-size:12px;
+      pointer-events:none;
+      opacity:.7;
+    }
+    .calMain{ flex:1; min-width:0; }
+
+    .sideTitle{ font-weight:900; }
+    .sideSub{ color:var(--muted); font-size:12px; margin-top:4px; }
+
+    .sideTable{
+      margin-top:10px;
+      border:1px solid var(--line);
+      border-radius:12px;
+      overflow:auto;
+    }
+    .sideTable table{
+      width:100%;
+      border-collapse:collapse;
+      table-layout:fixed;
+      min-width:0;
+    }
+    .sideTable th, .sideTable td{
+      padding:8px 8px;
+      border-bottom:1px solid var(--line);
+      text-align:right;
+      font-size:12px;
+      white-space:nowrap;
+    }
+    .sideTable th:first-child, .sideTable td:first-child{ text-align:left; }
+    .sideTable thead th{ background:var(--panel2); position:sticky; top:0; z-index:2; }
+    .sideTable td:first-child{
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+    }
+    .sideNote{ color:var(--muted); font-size:11px; margin-top:8px; }
+
+    .calGrid{ display:grid; grid-template-columns: repeat(5, 1fr); gap:10px; }
+    .calDow{ text-align:center; color:var(--muted); font-weight:900; padding:6px 0; }
+
+    .calCell{
+      background:var(--panel);
+      border:1px solid var(--line);
+      border-radius:12px;
+      padding:10px;
+      min-height:480px;
+      display:flex;
+      flex-direction:column;
+      gap:6px;
+      overflow:hidden;
+    }
+    .calDayLine{ display:flex; align-items:center; justify-content:space-between; }
+    .calDay{ font-weight:900; }
+    .calCnt{ font-size:12px; color:var(--muted); }
+    .chip{
+      display:inline-block; background:var(--chip); border:1px solid var(--line);
+      border-radius:999px; padding:2px 8px; font-size:11px; margin-left:6px;
+    }
+    .evtBox{ overflow:auto; padding-right:4px; flex: 1; }
+    .evtMini{
+      font-size:12px; line-height:1.35;
+      padding:4px 0; border-bottom:1px dashed rgba(0,0,0,.08);
+      white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+    }
+    .evtMini:last-child{ border-bottom:none; }
+    .evtMini .t{ color:var(--muted); margin-right:6px; font-weight:900; }
+
+    /* ============================================================
+       === [PATCH B] SM 하이라이트(연하게) - 달력 리스트
+       ============================================================ */
+    .evtMini.sm{
+      background: rgba(37,99,235,.07);
+      border-radius: 8px;
+      padding: 4px 6px;
+    }
+
+    .moreBtn{
+      margin-top:6px; border:1px solid var(--line); background:transparent;
+      border-radius:10px; padding:8px 10px; cursor:pointer; font-weight:900;
+    }
+    .warn{
+      margin-top:10px; padding:10px 12px;
+      border-radius:12px; border:1px solid var(--line);
+      background:var(--panel2); color:var(--muted); font-size:12px;
+    }
+
+    /* Modal */
+    .modalBg{
+      position:fixed; inset:0; background:rgba(15,23,42,.35);
+      display:none; align-items:center; justify-content:center; z-index:999; padding:16px;
+    }
+    .modal{
+      width:min(960px, 100%); max-height:80vh; overflow:auto;
+      background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:14px;
+      box-shadow:0 10px 30px rgba(0,0,0,.15);
+    }
+    .modalTop{
+      display:flex; align-items:center; justify-content:space-between; gap:10px;
+      position:sticky; top:0; background:var(--panel);
+      padding-bottom:10px; border-bottom:1px solid var(--line);
+    }
+    .modalTitle{ font-weight:900; }
+    .modalClose{ border:1px solid var(--line); background:transparent; border-radius:10px; padding:8px 10px; cursor:pointer; font-weight:900; }
+    .modalList{ display:grid; gap:8px; margin-top:12px; }
+    .evtCard{ background:var(--panel2); border:1px solid var(--line); border-radius:12px; padding:10px; }
+    .evtTitle{ font-weight:900; }
+    .evtSub{ color:var(--muted); font-size:12px; margin-top:4px; }
+
+    /* SM 카드도 연하게 */
+    .evtCard.sm{
+      border-color: rgba(37,99,235,.25);
+      background: rgba(37,99,235,.06);
+    }
+
+    @media (max-width: 1200px){
+      .calWrap{ flex-direction:column; }
+      .calSide{
+        width:100%;
+        max-width:none;
+        resize:vertical;
+        position:relative;
+        top:auto;
+        max-height:none;
+      }
+      .calSide::after{ content:"↕"; top:auto; bottom:6px; right:10px; transform:none; }
+      .scopeKpis{ width:100%; margin-left:0; }
+      .scopeKpi{ flex:1; min-width:220px; }
+    }
+    @media (max-width: 1100px){
+      .wrap{ grid-template-columns: 1fr; }
+      input{ width:200px; }
+      table{ min-width:1080px; }
+      .calGrid{ grid-template-columns: repeat(2, 1fr); }
+      .calCell{ min-height:360px; }
+    }
+  </style>
+</head>
+
+<body>
+  <div class="topbar">
+    <div class="topRow">
+      <div class="titleTop">월간 리포트</div>
+      <div class="subTop" id="topSub">-</div>
+      <div class="spacer"></div>
+      <button class="btn ghost" id="calBtn">달력</button>
+      <button class="btn ghost" id="backBtn" style="display:none;">리포트</button>
+    </div>
+
+    <div class="filterRow">
+      <select id="region"></select>
+      <select id="team"></select>
+      <select id="emp"></select>
+      <select id="field"></select>
+      <input id="search" placeholder="사원명/사번/권역/팀/분야/이벤트 검색" />
+
+      <div class="scopeKpis">
+        <div class="scopeKpi">
+          <div class="scopeLbl">선택 권역 평균 (콜/중식/석식)</div>
+          <div class="scopeVal" id="sk_region">-</div>
+          <div class="scopeSub" id="sk_region_sub">-</div>
+        </div>
+        <div class="scopeKpi">
+          <div class="scopeLbl">선택 팀 평균 (콜/중식/석식)</div>
+          <div class="scopeVal" id="sk_team">-</div>
+          <div class="scopeSub" id="sk_team_sub">-</div>
+        </div>
+        <div class="scopeKpi">
+          <div class="scopeLbl">선택 인원 평균 (콜/중식/석식)</div>
+          <div class="scopeVal" id="sk_emp">-</div>
+          <div class="scopeSub" id="sk_emp_sub">-</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="wrap" id="reportView">
+    <div class="card">
+      <div class="cardTitle">요약</div>
+      <div class="cardSub" id="leftSub">-</div>
+
+      <div class="tabs">
+        <button class="tab active" data-tab="03팀원">03팀원</button>
+        <button class="tab" data-tab="02팀장">02팀장</button>
+      </div>
+
+      <div style="display:flex; gap:10px; align-items:center; margin-top:10px; flex-wrap:wrap;">
+        <div class="cardSub">요약 월 선택</div>
+        <select id="kpiYm"></select>
+      </div>
+
+      <div class="kpi">
+        <div class="item"><div class="label" id="kpi_lbl_all">-</div><div class="value" id="kpi_all">-</div></div>
+        <div class="item"><div class="label">종병분야 평균 (콜/중식/석식)</div><div class="value" id="kpi_gh">-</div></div>
+        <div class="item"><div class="label">병원분야 평균 (콜/중식/석식)</div><div class="value" id="kpi_cl">-</div></div>
+        <div class="item"><div class="label">성장 평균 (콜/중식/석식)</div><div class="value" id="kpi_gr">-</div></div>
+        <div class="item"><div class="label">선택 권역 평균 (콜/중식/석식)</div><div class="value" id="kpi_region">-</div></div>
+        <div class="item"><div class="label">선택 부과 평균 (콜/중식/석식)</div><div class="value" id="kpi_team">-</div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="cardTitle">상세</div>
+      <div class="cardSub" id="mainSub">-</div>
+
+      <div class="grid">
+        <table id="tbl">
+          <thead><tr id="theadRow"></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div id="calendarView">
+    <div class="card" style="max-width:none; margin:0 auto;">
+      <div class="calTop">
+        <div>
+          <div class="cardTitle">달력</div>
+          <div class="cardSub" id="calSub">-</div>
+        </div>
+
+        <div class="calNav">
+          <select id="calYm"></select>
+          <select id="calType">
+            <option value="ALL">전체(CALL+SM)</option>
+            <option value="CALL">CALL만</option>
+            <option value="SM">SM만</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="warn" id="calWarn" style="display:none;"></div>
+
+      <div class="calWrap">
+        <div class="calSide" id="calSide">
+          <div class="sideTitle">품목별 요약</div>
+          <div class="sideSub" id="calSumSub">-</div>
+          <div class="sideTable" id="calSumTable"></div>
+          <div class="sideNote">
+            ※ 드래그로 폭 조절 가능 / 더블클릭 시 폭 초기화 / 새로고침해도 유지됩니다.
+          </div>
+        </div>
+
+        <div class="calMain">
+          <div class="calGrid" id="calGrid"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal -->
+  <div class="modalBg" id="modalBg">
+    <div class="modal">
+      <div class="modalTop">
+        <div class="modalTitle" id="modalTitle">-</div>
+        <button class="modalClose" id="modalClose">닫기</button>
+      </div>
+      <div class="modalList" id="modalList"></div>
+    </div>
+  </div>
+
+<script>
+  const $ = (id)=>document.getElementById(id);
+  const MONTHS = (window.__DATA_MONTHS__ || []).slice().sort();
+  const STORE  = (window.__DATASTORE__ || {});
+  let ACTIVE_TAB = "03팀원";
+  let CAL_YM = MONTHS.length ? MONTHS[MONTHS.length-1] : "202601";
+
+  const REGION_ORDER = [
+    "서울1권역","서울2권역","서울3권역","서울4권역",
+    "경기1권역","경기2권역","경기3권역",
+    "인천권역","부산권역","대구권역","대전권역","광주권역","전주권역","강원권역",
+    "영남1권역","영남2권역","충청권역"
+  ];
+  const regionRank = new Map(REGION_ORDER.map((v,i)=>[v,i]));
+  function sortRegions(arr){
+    return (arr||[]).slice().sort((a,b)=>{
+      const ia = regionRank.has(a) ? regionRank.get(a) : 999;
+      const ib = regionRank.has(b) ? regionRank.get(b) : 999;
+      if(ia !== ib) return ia - ib;
+      return String(a).localeCompare(String(b), "ko");
+    });
+  }
+  function sortFields(arr){
+    const order = ["종병분야","병원분야","성장"];
+    const rank = new Map(order.map((v,i)=>[v,i]));
+    return (arr||[]).slice().sort((a,b)=>{
+      const ia = rank.has(a) ? rank.get(a) : 999;
+      const ib = rank.has(b) ? rank.get(b) : 999;
+      if(ia !== ib) return ia - ib;
+      return String(a).localeCompare(String(b), "ko");
+    });
+  }
+
+  function fillSelect(sel, arr, includeAll=true, allLabel="전체"){
+    const items = includeAll ? [allLabel, ...(arr||[])] : (arr||[]);
+    sel.innerHTML = items.map(v=>`<option value="${v}">${v}</option>`).join("");
+  }
+  function empKey(name, code){ return `${name||""} (${code||""})`; }
+  function empCodeFromLabel(v){
+    if(!v || v==="전체") return null;
+    const m = String(v).match(/\((\d{7})\)\s*$/);
+    return m ? m[1] : null;
+  }
+  function currentFilters(){
+    return {
+      region: $("region").value,
+      team: $("team").value,
+      field: $("field").value,
+      empLabel: $("emp").value,
+      empCode: empCodeFromLabel($("emp").value),
+      q: $("search").value.trim().toLowerCase()
+    };
+  }
+
+  function avgOf(nums){
+    const xs = nums.filter(x => Number.isFinite(x));
+    if(!xs.length) return null;
+    return xs.reduce((s,x)=>s+x,0)/xs.length;
+  }
+  function setKPICombo(id, avgVal, lunchVal, dinnerVal){
+    const el = $(id);
+    const a = (avgVal==null||!Number.isFinite(avgVal)) ? "-" : avgVal.toFixed(2);
+    const l = (lunchVal==null||!Number.isFinite(lunchVal)) ? "-" : Math.round(lunchVal).toLocaleString();
+    const d = (dinnerVal==null||!Number.isFinite(dinnerVal)) ? "-" : Math.round(dinnerVal).toLocaleString();
+    el.textContent = `${a} / ${l} / ${d}`;
+  }
+  function fieldModeOf(field){
+    const s = String(field||"");
+    if (s.includes("종병")) return "GH";
+    if (s.includes("병원")) return "CL";
+    if (s.includes("성장")) return "GR";
+    return "ETC";
+  }
+  function fieldModeFromFilterValue(v){
+    const s = String(v||"");
+    if(s === "전체") return "ALL";
+    if(s.includes("종병")) return "GH";
+    if(s.includes("병원")) return "CL";
+    if(s.includes("성장")) return "GR";
+    return "ALL";
+  }
+
+  function buildMatrixForRole(role){
+    const empMap = new Map();
+    for(const ym of MONTHS){
+      const rows = (STORE[ym] && STORE[ym].rows) ? STORE[ym].rows : [];
+      for(const r of rows){
+        if (String(r.role||"") !== role) continue;
+        const code = String(r.empCode||"").trim();
+        if(!code) continue;
+
+        if(!empMap.has(code)){
+          empMap.set(code, {
+            region: r.region||"",
+            team: r.team||"",
+            field: r.field||"",
+            empCode: code,
+            empName: r.empName||"",
+            role: r.role||"",
+            months: {}
+          });
+        }
+        empMap.get(code).months[ym] = {
+          avg: Number(r.kpi?.avg ?? 0),
+          lunch: Number(r.kpi?.lunch ?? 0),
+          dinner: Number(r.kpi?.dinner ?? 0)
+        };
+      }
+    }
+    return Array.from(empMap.values());
+  }
+
+  function displayCell(v){
+    if(!v) return "-";
+    const a = Number.isFinite(v.avg) ? v.avg.toFixed(2) : "0.00";
+    const l = Number.isFinite(v.lunch) ? Math.round(v.lunch).toLocaleString() : "0";
+    const d = Number.isFinite(v.dinner) ? Math.round(v.dinner).toLocaleString() : "0";
+    return `${a} / ${l} / ${d}`;
+  }
+
+  function computeOptionsForRole(role){
+    const matrix = buildMatrixForRole(role);
+    const regions = sortRegions(Array.from(new Set(matrix.map(x=>x.region).filter(Boolean))));
+
+    const teamsByRegion = new Map();
+    for(const r of matrix){
+      if(!r.region || !r.team) continue;
+      if(!teamsByRegion.has(r.region)) teamsByRegion.set(r.region, new Set());
+      teamsByRegion.get(r.region).add(r.team);
+    }
+
+    const empsByRegionTeam = new Map();
+    for(const r of matrix){
+      const key = `${r.region}||${r.team}`;
+      if(!empsByRegionTeam.has(key)) empsByRegionTeam.set(key, new Set());
+      empsByRegionTeam.get(key).add(empKey(r.empName, r.empCode));
+    }
+
+    const fields = sortFields(Array.from(new Set(matrix.map(x=>x.field).filter(Boolean))));
+    return {matrix, regions, teamsByRegion, empsByRegionTeam, fields};
+  }
+
+  let OPT = computeOptionsForRole(ACTIVE_TAB);
+
+  function syncRegionOptions(){
+    fillSelect($("region"), OPT.regions, true, "전체");
+    if(!$("region").value) $("region").value = "전체";
+  }
+  function syncTeamOptions(){
+    const region = $("region").value || "전체";
+    let teams = [];
+    if(region === "전체"){
+      const s = new Set();
+      for(const setV of OPT.teamsByRegion.values()){
+        for(const t of setV) s.add(t);
+      }
+      teams = Array.from(s).sort((a,b)=>String(a).localeCompare(String(b),"ko"));
+    } else {
+      teams = Array.from(OPT.teamsByRegion.get(region) || []).sort((a,b)=>String(a).localeCompare(String(b),"ko"));
+    }
+    const prev = $("team").value;
+    fillSelect($("team"), teams, true, "전체");
+    $("team").value = (prev && teams.includes(prev)) ? prev : "전체";
+  }
+  function syncEmpOptions(){
+    const region = $("region").value || "전체";
+    const team = $("team").value || "전체";
+
+    let emps = [];
+    if(region === "전체" && team === "전체"){
+      const s = new Set();
+      for(const setV of OPT.empsByRegionTeam.values()){
+        for(const e of setV) s.add(e);
+      }
+      emps = Array.from(s).sort((a,b)=>String(a).localeCompare(String(b),"ko"));
+    } else if(region !== "전체" && team === "전체"){
+      const s = new Set();
+      for(const [key,setV] of OPT.empsByRegionTeam.entries()){
+        if(key.startsWith(region+"||")){
+          for(const e of setV) s.add(e);
+        }
+      }
+      emps = Array.from(s).sort((a,b)=>String(a).localeCompare(String(b),"ko"));
+    } else {
+      emps = Array.from(OPT.empsByRegionTeam.get(`${region}||${team}`) || []).sort((a,b)=>String(a).localeCompare(String(b),"ko"));
+    }
+
+    const prev = $("emp").value;
+    fillSelect($("emp"), emps, true, "전체");
+    $("emp").value = (prev && emps.includes(prev)) ? prev : "전체";
+  }
+  function syncFieldOptions(){
+    fillSelect($("field"), OPT.fields, true, "전체");
+    if(!$("field").value) $("field").value = "전체";
+  }
+
+  function initKpiYm(){
+    fillSelect($("kpiYm"), MONTHS, true, "전체");
+    $("kpiYm").value = "전체";
+  }
+
+  function collectKpi(kind, role, scope, ymSel, fieldMode){
+    const nums = [];
+    const monthsToUse = (ymSel && ymSel !== "전체") ? [ymSel] : MONTHS;
+
+    for(const ym of monthsToUse){
+      const rows = (STORE[ym] && STORE[ym].rows) ? STORE[ym].rows : [];
+      for(const r of rows){
+        if(String(r.role||"") !== role) continue;
+
+        if(scope.region && String(r.region||"") !== scope.region) continue;
+        if(scope.team && String(r.team||"") !== scope.team) continue;
+        if(scope.empCode && String(r.empCode||"") !== scope.empCode) continue;
+
+        if(fieldMode && fieldMode !== "ALL"){
+          const fm = fieldModeOf(r.field);
+          if(fieldMode === "GH" && fm !== "GH") continue;
+          if(fieldMode === "CL" && fm !== "CL") continue;
+          if(fieldMode === "GR" && fm !== "GR") continue;
+        }
+
+        let v = 0;
+        if(kind === "avg") v = Number(r.kpi?.avg ?? 0);
+        else v = Number((r.kpi && r.kpi[kind]) ?? 0);
+
+        if(Number.isFinite(v)) nums.push(v);
+      }
+    }
+    return nums;
+  }
+
+  function renderLeftKPIs(){
+    const f = currentFilters();
+    const ymSel = ($("kpiYm") && $("kpiYm").value) ? $("kpiYm").value : "전체";
+    const role = ACTIVE_TAB;
+
+    $("kpi_lbl_all").textContent = `${role} 전체 평균 (콜/중식/석식)`;
+    const baseScope = { empCode: f.empCode || null };
+
+    setKPICombo("kpi_all",
+      avgOf(collectKpi("avg", role, baseScope, ymSel, "ALL")),
+      avgOf(collectKpi("lunch", role, baseScope, ymSel, "ALL")),
+      avgOf(collectKpi("dinner", role, baseScope, ymSel, "ALL")),
+    );
+    setKPICombo("kpi_gh",
+      avgOf(collectKpi("avg", role, baseScope, ymSel, "GH")),
+      avgOf(collectKpi("lunch", role, baseScope, ymSel, "GH")),
+      avgOf(collectKpi("dinner", role, baseScope, ymSel, "GH")),
+    );
+    setKPICombo("kpi_cl",
+      avgOf(collectKpi("avg", role, baseScope, ymSel, "CL")),
+      avgOf(collectKpi("lunch", role, baseScope, ymSel, "CL")),
+      avgOf(collectKpi("dinner", role, baseScope, ymSel, "CL")),
+    );
+    setKPICombo("kpi_gr",
+      avgOf(collectKpi("avg", role, baseScope, ymSel, "GR")),
+      avgOf(collectKpi("lunch", role, baseScope, ymSel, "GR")),
+      avgOf(collectKpi("dinner", role, baseScope, ymSel, "GR")),
+    );
+
+    const regionScope = (f.region && f.region !== "전체") ? f.region : null;
+    const teamScope   = (f.team && f.team !== "전체") ? f.team : null;
+
+    // =========================================================
+    // ✅ [수정 포인트 1]
+    // 리포트 요약 "선택 권역/부과 평균"은 '팀 평균'이 되어야 하므로
+    // emp(인원) 필터를 무시하고 계산 (팀 평균이 팀 평균으로 유지)
+    // + field(분야) 필터도 동일하게 반영해서 오른쪽 상단 팀 평균과 값 일치
+    // =========================================================
+    const fieldMode = fieldModeFromFilterValue(f.field);
+
+    if(!regionScope) setKPICombo("kpi_region", null, null, null);
+    else {
+      const scope = { region: regionScope }; // ✅ empCode 제거
+      setKPICombo("kpi_region",
+        avgOf(collectKpi("avg", role, scope, ymSel, fieldMode)),
+        avgOf(collectKpi("lunch", role, scope, ymSel, fieldMode)),
+        avgOf(collectKpi("dinner", role, scope, ymSel, fieldMode)),
+      );
+    }
+
+    if(!teamScope) setKPICombo("kpi_team", null, null, null);
+    else {
+      const scope = { team: teamScope }; // ✅ empCode 제거
+      if(regionScope) scope.region = regionScope; // ✅ 권역 선택시 팀 중복 방지
+      setKPICombo("kpi_team",
+        avgOf(collectKpi("avg", role, scope, ymSel, fieldMode)),
+        avgOf(collectKpi("lunch", role, scope, ymSel, fieldMode)),
+        avgOf(collectKpi("dinner", role, scope, ymSel, fieldMode)),
+      );
+    }
+  }
+
+  function isCalendarVisible(){
+    return $("calendarView").style.display !== "none";
+  }
+  function currentTopKpiMonth(){
+    if(isCalendarVisible()) return CAL_YM;
+    const ymSel = ($("kpiYm") && $("kpiYm").value) ? $("kpiYm").value : "전체";
+    return ymSel;
+  }
+  function setScopeCard(valId, subId, label, combo, subText){
+    $(valId).textContent = combo ?? "-";
+    $(subId).textContent = subText ?? "-";
+  }
+  function fmtCombo(avgVal, lunchVal, dinnerVal){
+    const a = (avgVal==null||!Number.isFinite(avgVal)) ? "-" : avgVal.toFixed(2);
+    const l = (lunchVal==null||!Number.isFinite(lunchVal)) ? "-" : Math.round(lunchVal).toLocaleString();
+    const d = (dinnerVal==null||!Number.isFinite(dinnerVal)) ? "-" : Math.round(dinnerVal).toLocaleString();
+    return `${a} / ${l} / ${d}`;
+  }
+  function renderTopScopeKPIs(){
+    const f = currentFilters();
+    const role = ACTIVE_TAB;
+    const ymSel = currentTopKpiMonth();
+    const fieldMode = fieldModeFromFilterValue(f.field);
+
+    if(f.region && f.region !== "전체"){
+      const scope = { region: f.region };
+      const a = avgOf(collectKpi("avg", role, scope, ymSel, fieldMode));
+      const l = avgOf(collectKpi("lunch", role, scope, ymSel, fieldMode));
+      const d = avgOf(collectKpi("dinner", role, scope, ymSel, fieldMode));
+      setScopeCard("sk_region","sk_region_sub","권역", fmtCombo(a,l,d), `${f.region} · ${ymSel}`);
+    } else {
+      setScopeCard("sk_region","sk_region_sub","권역", "-", "권역 미선택");
+    }
+
+    if(f.team && f.team !== "전체"){
+      const scope = { team: f.team };
+      if(f.region && f.region !== "전체") scope.region = f.region;
+      const a = avgOf(collectKpi("avg", role, scope, ymSel, fieldMode));
+      const l = avgOf(collectKpi("lunch", role, scope, ymSel, fieldMode));
+      const d = avgOf(collectKpi("dinner", role, scope, ymSel, fieldMode));
+      const sub = (f.region && f.region !== "전체") ? `${f.region} / ${f.team} · ${ymSel}` : `${f.team} · ${ymSel}`;
+      setScopeCard("sk_team","sk_team_sub","팀", fmtCombo(a,l,d), sub);
+    } else {
+      setScopeCard("sk_team","sk_team_sub","팀", "-", "팀 미선택");
+    }
+
+    if(f.empCode){
+      const scope = { empCode: f.empCode };
+      const a = avgOf(collectKpi("avg", role, scope, ymSel, fieldMode));
+      const l = avgOf(collectKpi("lunch", role, scope, ymSel, fieldMode));
+      const d = avgOf(collectKpi("dinner", role, scope, ymSel, fieldMode));
+      setScopeCard("sk_emp","sk_emp_sub","인원", fmtCombo(a,l,d), `${f.empLabel} · ${ymSel}`);
+    } else {
+      setScopeCard("sk_emp","sk_emp_sub","인원", "-", "인원 미선택");
+    }
+  }
+
+  function renderTable(){
+    const thead = $("theadRow");
+    const tbody = document.querySelector("#tbl tbody");
+    thead.innerHTML = "";
+    tbody.innerHTML = "";
+
+    const f = currentFilters();
+    const empCode = f.empCode;
+
+    let matrix = buildMatrixForRole(ACTIVE_TAB);
+
+    if(f.region!=="전체") matrix = matrix.filter(r=>r.region===f.region);
+    if(f.team!=="전체") matrix = matrix.filter(r=>r.team===f.team);
+    if(f.field!=="전체") matrix = matrix.filter(r=>r.field===f.field);
+    if(empCode) matrix = matrix.filter(r=>r.empCode===empCode);
+
+    if(f.q){
+      const q = f.q;
+      matrix = matrix.filter(r=>{
+        const name  = String(r.empName||"").toLowerCase();
+        const code  = String(r.empCode||"").toLowerCase();
+        const region= String(r.region||"").toLowerCase();
+        const team  = String(r.team||"").toLowerCase();
+        const field = String(r.field||"").toLowerCase();
+        return name.includes(q) || code.includes(q) || region.includes(q) || team.includes(q) || field.includes(q);
+      });
+    }
+
+    $("topSub").textContent = `표시 월: ${MONTHS.length}개`;
+    $("leftSub").textContent = `표시 월: ${MONTHS.join(", ")}`;
+    $("mainSub").textContent = `${f.region} / ${f.team} / ${f.empLabel} / ${f.field} / ${ACTIVE_TAB}`;
+
+    const baseCols = ["권역명","부과명2","분야","사원코드","사원명","직책"];
+    baseCols.forEach(lbl=>{
+      const th = document.createElement("th");
+      th.textContent = lbl;
+      thead.appendChild(th);
+    });
+
+    MONTHS.forEach(ym=>{
+      const th = document.createElement("th");
+      th.innerHTML = `<div style="font-weight:900;">${ym}</div>
+                      <div style="margin-top:2px;font-size:11px;color:var(--muted);font-weight:800;">
+                        평균콜수 / 중식횟수 / 석식횟수
+                      </div>`;
+      thead.appendChild(th);
+    });
+
+    for(const r of matrix){
+      const tr = document.createElement("tr");
+      const cells = [
+        `<td class="left">${r.region||""}</td>`,
+        `<td class="left">${r.team||""}</td>`,
+        `<td>${r.field||""}</td>`,
+        `<td>${r.empCode||""}</td>`,
+        `<td class="left">${r.empName||""}</td>`,
+        `<td>${r.role||""}</td>`
+      ];
+      for(const ym of MONTHS){
+        cells.push(`<td class="center num">${displayCell(r.months[ym])}</td>`);
+      }
+      tr.innerHTML = cells.join("");
+      tbody.appendChild(tr);
+    }
+
+    renderLeftKPIs();
+    renderTopScopeKPIs();
+  }
+
+  // ===== Calendar =====
+  function ymToParts(ym){
+    const y = Number(String(ym).slice(0,4));
+    const m = Number(String(ym).slice(4,6)) - 1;
+    return {y,m};
+  }
+  function isWeekday(dateStr){
+    const parts = String(dateStr||"").split("-");
+    if(parts.length !== 3) return true;
+    const y = Number(parts[0]), m = Number(parts[1])-1, d = Number(parts[2]);
+    const dt = new Date(y,m,d);
+    const dow = dt.getDay();
+    return dow !== 0 && dow !== 6;
+  }
+
+  function fmtEventLine(e){
+    const t = String(e.type||"");
+    if(t === "CALL"){
+      const acc = String(e.account||"").trim();
+      const hcp = String(e.person||"").trim();
+      const item = String(e.item||"").trim();
+      return `${acc}${hcp ? " - " + hcp : ""}${item ? "(" + item + ")" : ""}`.trim();
+    }
+    if(t === "SM"){
+      // =========================================================
+      // ✅ [수정 포인트 2]
+      // SM 이벤트에서 거래처(괄호) 제거: 고객-품목(구분명 구분)
+      // (고객이 비어있을 때만 안전하게 거래처를 대체값으로 사용)
+      // =========================================================
+      const cust = String(e.person||"").trim();
+      const acc  = String(e.account||"").trim();
+      const item = String(e.item||"").trim();
+      const kindName = String(e.kindName||"").trim();
+      const kind = String(e.kind||"").trim();
+
+      let left = cust;
+      if(!left) left = acc; // fallback only
+      const sub = `${kindName}${kind ? " " + kind : ""}`.trim();
+      return `${left}-${item}${sub ? "(" + sub + ")" : ""}`.trim();
+    }
+    return "-";
+  }
+
+  function getFilteredEvents(ym){
+    const f = currentFilters();
+    const pack = STORE[ym] || {};
+    const events = (pack.events || []).slice();
+    const type = $("calType").value || "ALL";
+
+    return events.filter(e=>{
+      if(String(e.role||"") !== ACTIVE_TAB) return false;
+
+      if(f.region!=="전체" && String(e.region||"") !== f.region) return false;
+      if(f.team!=="전체" && String(e.team||"") !== f.team) return false;
+      if(f.field!=="전체" && String(e.field||"") !== f.field) return false;
+      if(f.empCode && String(e.empCode||"") !== f.empCode) return false;
+
+      if(type!=="ALL" && String(e.type||"") !== type) return false;
+
+      if(f.q){
+        const q = f.q;
+        const line = fmtEventLine(e).toLowerCase();
+        const empN = String(e.empName||"").toLowerCase();
+        const empC = String(e.empCode||"").toLowerCase();
+        const region= String(e.region||"").toLowerCase();
+        const team= String(e.team||"").toLowerCase();
+        const field= String(e.field||"").toLowerCase();
+        if(!line.includes(q) && !empN.includes(q) && !empC.includes(q) && !region.includes(q) && !team.includes(q) && !field.includes(q)) return false;
+      }
+      return true;
+    });
+  }
+
+  function groupByDate(events){
+    const map = new Map();
+    for(const e of events){
+      const d = String(e.date||"");
+      if(!d) continue;
+      if(!isWeekday(d)) continue;
+      if(!map.has(d)) map.set(d, []);
+      map.get(d).push(e);
+    }
+
+    for(const [k,arr] of map.entries()){
+      arr.sort((a,b)=>{
+        const rank = (t)=> (t==="SM" ? 0 : (t==="CALL" ? 1 : 9));
+        const ra = rank(String(a.type||""));
+        const rb = rank(String(b.type||""));
+        if(ra !== rb) return ra - rb;
+        return String(a.item||"").localeCompare(String(b.item||""), "ko");
+      });
+    }
+
+    return map;
+  }
+
+  function openModal(title, items){
+    $("modalTitle").textContent = title;
+    const list = $("modalList");
+    list.innerHTML = "";
+    for(const e of items){
+      const line = fmtEventLine(e);
+      const sub = `${e.empName||""}(${e.empCode||""}) · ${e.region||""}/${e.team||""}/${e.field||""}`;
+      const card = document.createElement("div");
+      card.className = (String(e.type)==="SM") ? "evtCard sm" : "evtCard";
+      card.innerHTML = `<div class="evtTitle">[${e.type}] ${line}</div><div class="evtSub">${sub}</div>`;
+      list.appendChild(card);
+    }
+    $("modalBg").style.display = "flex";
+  }
+  function closeModal(){ $("modalBg").style.display = "none"; }
+  $("modalClose").addEventListener("click", closeModal);
+  $("modalBg").addEventListener("click", (ev)=>{ if(ev.target.id==="modalBg") closeModal(); });
+
+  function renderCalendarSummary(filteredEvents){
+    const map = new Map();
+
+    for(const e of filteredEvents){
+      const d = String(e.date||"");
+      if(!d || !isWeekday(d)) continue;
+
+      const item = String(e.item||"").trim();
+      if(!item) continue;
+
+      if(!map.has(item)) map.set(item, {call:0, lunch:0, dinner:0});
+      const rec = map.get(item);
+
+      if(String(e.type)==="CALL"){
+        rec.call += 1;
+      } else if(String(e.type)==="SM"){
+        const kind = String(e.kind||"").trim();
+        if(kind === "석식") rec.dinner += 1;
+        else if(kind === "중식" || kind === "조식") rec.lunch += 1;
+        else rec.lunch += 1;
+      }
+    }
+
+    const rows = Array.from(map.entries())
+      .map(([item, v])=>({item, ...v, total: v.call+v.lunch+v.dinner}))
+      .sort((a,b)=> b.total - a.total || b.call - a.call || a.item.localeCompare(b.item,"ko"));
+
+    let totalCall=0, totalLunch=0, totalDinner=0;
+    for(const r of rows){
+      totalCall += r.call; totalLunch += r.lunch; totalDinner += r.dinner;
+    }
+
+    const f = currentFilters();
+    const calType = $("calType").value || "ALL";
+    $("calSumSub").textContent =
+      `월:${CAL_YM} · 탭:${ACTIVE_TAB} · 타입:${calType} · ${f.region}/${f.team}/${f.empLabel}/${f.field}` +
+      (f.q ? ` · 검색:"${f.q}"` : "");
+
+    if(!rows.length){
+      $("calSumTable").innerHTML = `<div style="padding:10px; color:var(--muted); font-size:12px;">표시할 품목 집계가 없습니다.</div>`;
+      return;
+    }
+
+    const top = rows.slice(0, 50);
+
+    const tableHtml = `
+      <table>
+        <colgroup>
+          <col style="width:58%">
+          <col style="width:14%">
+          <col style="width:14%">
+          <col style="width:14%">
+        </colgroup>
+        <thead>
+          <tr>
+            <th>품목</th>
+            <th>콜수</th>
+            <th>중식</th>
+            <th>석식</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr style="font-weight:900;">
+            <td>합계</td>
+            <td>${totalCall.toLocaleString()}</td>
+            <td>${totalLunch.toLocaleString()}</td>
+            <td>${totalDinner.toLocaleString()}</td>
+          </tr>
+          ${top.map(r=>`
+            <tr>
+              <td title="${String(r.item||"").replaceAll('"','&quot;')}">${r.item}</td>
+              <td>${r.call.toLocaleString()}</td>
+              <td>${r.lunch.toLocaleString()}</td>
+              <td>${r.dinner.toLocaleString()}</td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    `;
+    $("calSumTable").innerHTML = tableHtml;
+  }
+
+  function renderCalendar(){
+    const pack = STORE[CAL_YM] || {};
+    const warn = $("calWarn");
+    const totalEvents = (pack.events || []).length;
+
+    if(totalEvents === 0){
+      warn.style.display = "";
+      warn.textContent = `⚠ ${CAL_YM} events가 0건입니다. (JSON 생성에서 이벤트가 생성되지 않았을 가능성)`;
+    } else {
+      warn.style.display = "none";
+      warn.textContent = "";
+    }
+
+    const {y, m} = ymToParts(CAL_YM);
+    $("calSub").textContent = `월: ${CAL_YM} · (월~금) 칸당 최대 20개 표시(초과는 더보기/클릭)`;
+
+    const filtered = getFilteredEvents(CAL_YM);
+    renderCalendarSummary(filtered);
+
+    const byDate = groupByDate(filtered);
+
+    const firstDay = new Date(y, m, 1);
+    const lastDay  = new Date(y, m + 1, 0);
+    const days = lastDay.getDate();
+
+    let html = "";
+
+    const dows = ["월","화","수","목","금"];
+    for(const d of dows){
+      html += `<div class="calDow">${d}</div>`;
+    }
+
+    let offset = 0;
+    const startDow = firstDay.getDay();
+    if (startDow >= 1 && startDow <= 5) offset = startDow - 1;
+    else offset = 0;
+
+    for(let i=0;i<offset;i++){
+      html += `<div></div>`;
+    }
+
+    for(let day=1; day<=days; day++){
+      const dt = new Date(y, m, day);
+      const dow = dt.getDay();
+      if(dow === 0 || dow === 6) continue;
+
+      const dateStr = `${y}-${String(m+1).padStart(2,"0")}-${String(day).padStart(2,"0")}`;
+      const items = byDate.get(dateStr) || [];
+      const cnt = items.length;
+
+      const preview = items.slice(0,20).map(e=>{
+        const tag = (e.type === "CALL") ? "CALL" : "SM";
+        const line = fmtEventLine(e);
+        const cls = (String(e.type)==="SM") ? "evtMini sm" : "evtMini";
+        return `<div class="${cls}" title="${line.replaceAll('"','&quot;')}"><span class="t">${tag}</span>${line}</div>`;
+      }).join("");
+
+      const more = (cnt > 20)
+        ? `<button class="moreBtn" data-date="${dateStr}">더보기 (+${cnt-20})</button>`
+        : "";
+
+      html += `
+        <div class="calCell" data-date="${dateStr}">
+          <div class="calDayLine">
+            <div class="calDay">${day}</div>
+            <div class="calCnt">${cnt ? `${cnt}건<span class="chip">표시 20</span>` : ""}</div>
+          </div>
+          <div class="evtBox">${preview || `<div class="evtMini" style="color:var(--muted);">-</div>`}</div>
+          ${more}
+        </div>
+      `;
+    }
+
+    $("calGrid").innerHTML = html;
+
+    document.querySelectorAll(".moreBtn").forEach(btn=>{
+      btn.addEventListener("click", (ev)=>{
+        ev.stopPropagation();
+        const dateStr = btn.dataset.date;
+        const full = byDate.get(dateStr) || [];
+        openModal(`${dateStr} (${full.length}건)`, full);
+      });
+    });
+
+    document.querySelectorAll(".calCell").forEach(cell=>{
+      cell.addEventListener("click", ()=>{
+        const dateStr = cell.dataset.date;
+        const full = byDate.get(dateStr) || [];
+        if(full.length) openModal(`${dateStr} (${full.length}건)`, full);
+      });
+    });
+
+    renderTopScopeKPIs();
+  }
+
+  function syncCalendarMonthOptions(){
+    fillSelect($("calYm"), MONTHS, false, "");
+    $("calYm").value = CAL_YM;
+  }
+
+  function showCalendar(){
+    $("reportView").style.display = "none";
+    $("calendarView").style.display = "block";
+    $("calBtn").style.display = "none";
+    $("backBtn").style.display = "inline-block";
+    syncCalendarMonthOptions();
+    renderCalendar();
+  }
+  function showReport(){
+    $("reportView").style.display = "grid";
+    $("calendarView").style.display = "none";
+    $("calBtn").style.display = "inline-block";
+    $("backBtn").style.display = "none";
+    renderTopScopeKPIs();
+  }
+
+  function initAllFilters(){
+    OPT = computeOptionsForRole(ACTIVE_TAB);
+    syncRegionOptions();
+    syncTeamOptions();
+    syncEmpOptions();
+    syncFieldOptions();
+
+    $("region").value = "전체";
+    $("team").value = "전체";
+    $("emp").value = "전체";
+    $("field").value = "전체";
+  }
+
+  function handleRegionChange(){
+    syncTeamOptions();
+    syncEmpOptions();
+    renderTable();
+    if($("calendarView").style.display !== "none") renderCalendar();
+    else renderTopScopeKPIs();
+  }
+  function handleTeamChange(){
+    syncEmpOptions();
+    renderTable();
+    if($("calendarView").style.display !== "none") renderCalendar();
+    else renderTopScopeKPIs();
+  }
+  function handleEmpChange(){
+    renderTable();
+    if($("calendarView").style.display !== "none") renderCalendar();
+    else renderTopScopeKPIs();
+  }
+
+  function initResizableSidePanel(){
+    const side = $("calSide");
+    if(!side) return;
+
+    const minW = 260, maxW = 780, defW = 360;
+    const saved = localStorage.getItem("calSideWidth");
+    if(saved){
+      let w = parseInt(saved, 10);
+      if(Number.isFinite(w)){
+        w = Math.max(minW, Math.min(maxW, w));
+        side.style.width = `${w}px`;
+      }
+    }
+
+    const saveWidth = ()=>{
+      const w = Math.round(side.getBoundingClientRect().width);
+      if(Number.isFinite(w)){
+        const ww = Math.max(minW, Math.min(maxW, w));
+        localStorage.setItem("calSideWidth", String(ww));
+      }
+    };
+    window.addEventListener("mouseup", saveWidth);
+    window.addEventListener("touchend", saveWidth);
+
+    side.addEventListener("dblclick", ()=>{
+      side.style.width = `${defW}px`;
+      localStorage.removeItem("calSideWidth");
+    });
+  }
+
+  function init(){
+    document.querySelectorAll(".tab").forEach(btn=>{
+      btn.addEventListener("click", ()=>{
+        document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active"));
+        btn.classList.add("active");
+        ACTIVE_TAB = btn.dataset.tab;
+
+        initAllFilters();
+        renderTable();
+        if($("calendarView").style.display !== "none") renderCalendar();
+      });
+    });
+
+    initAllFilters();
+    initKpiYm();
+    initResizableSidePanel();
+
+    $("region").addEventListener("change", handleRegionChange);
+    $("team").addEventListener("change", handleTeamChange);
+    $("emp").addEventListener("change", handleEmpChange);
+    $("field").addEventListener("change", ()=>{
+      renderTable();
+      if($("calendarView").style.display !== "none") renderCalendar();
+      else renderTopScopeKPIs();
+    });
+    $("search").addEventListener("input", ()=>{
+      renderTable();
+      if($("calendarView").style.display !== "none") renderCalendar();
+    });
+
+    $("kpiYm").addEventListener("change", ()=>{
+      renderLeftKPIs();
+      renderTopScopeKPIs();
+    });
+
+    $("calBtn").addEventListener("click", showCalendar);
+    $("backBtn").addEventListener("click", showReport);
+
+    $("calYm").addEventListener("change", ()=>{
+      CAL_YM = $("calYm").value;
+      renderCalendar();
+    });
+    $("calType").addEventListener("change", renderCalendar);
+
+    renderTable();
+    renderTopScopeKPIs();
+  }
+
+  init();
+</script>
+</body>
+</html>
+"""
+    html = HTML_TEMPLATE.replace("__MONTHS_JSON__", MONTHS_JSON).replace("__STORE_JSON__", STORE_JSON)
+    OUT_HTML.parent.mkdir(parents=True, exist_ok=True)
+    OUT_HTML.write_text(html, encoding="utf-8")
+    print("생성 완료:", OUT_HTML)
+
+
+# =========================================================
+# 6) 실행
+# =========================================================
+if __name__ == "__main__":
+    generate_all_months_json()
+    generate_report_html()
+    print("완료! 브라우저에서 report_offline.html을 Ctrl+F5로 새로고침해서 확인하세요.")
